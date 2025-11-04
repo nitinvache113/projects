@@ -1,0 +1,212 @@
+🚗 Smart Parking System using Arduino and IoT
+🎯 Project Objective
+
+To design a smart parking system that automatically detects whether a parking slot is available or occupied using ultrasonic sensors, and displays the real-time parking status on a web dashboard or local display.
+
+The system helps reduce congestion and time wasted searching for parking spots — a great real-world IoT application.
+
+🧠 Core Concepts Involved
+
+Embedded Systems (Arduino + Sensors)
+
+IoT Data Communication (Serial / MQTT / HTTP)
+
+Sensor Interfacing (Ultrasonic or IR Sensors)
+
+Real-time Data Visualization (Python / Node-RED / Web Dashboard)
+
+Hardware–Software Integration
+
+⚙️ Hardware Components
+Component	Description
+Arduino UNO / Mega	Main microcontroller board
+Ultrasonic Sensor (HC-SR04)	Detects car presence in parking slots
+LEDs (Green & Red)	Indicates slot availability
+Jumper Wires & Breadboard	For connections
+USB Cable	For uploading code and data transfer
+(Optional) NodeMCU / ESP8266	For Wi-Fi data transmission
+(Optional) LCD 16x2	For local slot display
+🔋 Software Requirements
+Tool	Purpose
+Arduino IDE	Write and upload code to microcontroller
+Python (with PySerial & Tkinter / Matplotlib)	For data visualization
+Node-RED (optional)	IoT dashboard interface
+Serial Monitor / COM Port Viewer	For testing sensor readings
+🔌 System Overview
+        [Ultrasonic Sensors]
+              |    |    |
+         Slot1 Slot2 Slot3
+              ↓    ↓    ↓
+        [Arduino Controller]
+              |
+       [USB/Serial Connection]
+              |
+      [Python/Node-RED Dashboard]
+              |
+        Display: Slot Availability
+
+
+Each sensor monitors one parking slot.
+If the distance < threshold (e.g., 10 cm), the slot is occupied, else it’s available.
+
+🧰 Circuit Connections
+Arduino Pin	Sensor	Description
+7	Trig (Sensor 1)	Trigger signal
+6	Echo (Sensor 1)	Echo signal
+5	Trig (Sensor 2)	Trigger signal
+4	Echo (Sensor 2)	Echo signal
+2	Green LED	Slot Available
+3	Red LED	Slot Occupied
+5V & GND	Common Power	Sensors & LEDs
+
+You can expand this for more slots (up to 6–8 sensors depending on board).
+
+💻 Arduino Code (C Language)
+
+Copy this into Arduino IDE → save as SmartParking.ino → upload to board.
+
+#define trigPin1 7
+#define echoPin1 6
+#define trigPin2 5
+#define echoPin2 4
+
+#define greenLED 2
+#define redLED 3
+
+long duration1, distance1;
+long duration2, distance2;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(trigPin1, OUTPUT);
+  pinMode(echoPin1, INPUT);
+  pinMode(trigPin2, OUTPUT);
+  pinMode(echoPin2, INPUT);
+  pinMode(greenLED, OUTPUT);
+  pinMode(redLED, OUTPUT);
+  Serial.println("Smart Parking System Initialized");
+}
+
+void loop() {
+  // Slot 1
+  digitalWrite(trigPin1, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin1, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin1, LOW);
+  duration1 = pulseIn(echoPin1, HIGH);
+  distance1 = duration1 * 0.034 / 2;
+
+  // Slot 2
+  digitalWrite(trigPin2, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin2, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin2, LOW);
+  duration2 = pulseIn(echoPin2, HIGH);
+  distance2 = duration2 * 0.034 / 2;
+
+  // Determine slot status
+  String slot1 = (distance1 < 10) ? "OCCUPIED" : "EMPTY";
+  String slot2 = (distance2 < 10) ? "OCCUPIED" : "EMPTY";
+
+  // Print to Serial
+  Serial.print("Slot 1: "); Serial.print(slot1);
+  Serial.print(" | Distance: "); Serial.print(distance1); Serial.println(" cm");
+  Serial.print("Slot 2: "); Serial.print(slot2);
+  Serial.print(" | Distance: "); Serial.print(distance2); Serial.println(" cm");
+  Serial.println("-----------------------------");
+
+  // LED indication
+  if (slot1 == "OCCUPIED" || slot2 == "OCCUPIED") {
+    digitalWrite(redLED, HIGH);
+    digitalWrite(greenLED, LOW);
+  } else {
+    digitalWrite(redLED, LOW);
+    digitalWrite(greenLED, HIGH);
+  }
+
+  delay(2000);
+}
+
+
+✅ This code detects whether slots are occupied or not and prints the status every 2 seconds.
+
+📊 Python Visualization Code
+
+Now, to visualize live parking slot data in Python using Serial communication.
+
+Install required modules:
+
+pip install pyserial matplotlib
+
+
+Save as parking_visual.py
+
+import serial
+import matplotlib.pyplot as plt
+from time import sleep
+
+# Adjust COM port according to your PC
+arduino = serial.Serial('COM4', 9600)
+
+print("Connected to Arduino... Reading data")
+
+while True:
+    line = arduino.readline().decode().strip()
+    if "Slot 1" in line:
+        print(line)
+    sleep(1)
+
+
+🧩 You can extend this Python code to:
+
+Plot graphs in real-time (matplotlib.animation)
+
+Build a GUI using Tkinter that shows slot availability in colors (Green = Available, Red = Occupied)
+
+Send data to a cloud dashboard (ThingSpeak / Node-RED / Blynk)
+
+🌐 Optional: Node-RED Dashboard (IoT Web Interface)
+
+If you want an IoT dashboard like Vayavya’s real-world setups:
+
+Install Node-RED on your PC (npm install -g node-red)
+
+Connect Arduino → Node-RED via Serial Input node (/dev/ttyUSB0 or COM4)
+
+Parse the serial data and map slot status to:
+
+Green/Red indicators for each slot
+
+Available/Occupied count display
+
+You can access your dashboard at:
+
+http://localhost:1880/ui
+
+🧪 Testing the Project
+Step	Description
+1	Upload the Arduino code and open Serial Monitor.
+2	Move your hand or an object near the sensor (<10 cm).
+3	Observe “OCCUPIED” status and Red LED turning ON.
+4	Remove object — LED changes to Green and shows “EMPTY.”
+5	Run Python script — observe live text output.
+
+✅ System is working when LED color and Python display match real sensor readings.
+
+📋 Expected Output
+
+Serial Monitor:
+
+Smart Parking System Initialized
+Slot 1: OCCUPIED | Distance: 6 cm
+Slot 2: EMPTY | Distance: 25 cm
+-----------------------------
+
+
+LEDs:
+
+Red = At least one slot occupied
+
+Green = All slots empty
