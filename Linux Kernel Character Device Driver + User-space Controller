@@ -1,0 +1,447 @@
+Project: Linux Kernel Character Device Driver + User-space Controller
+Project summary (one-line for resume)
+
+“Implemented a Linux kernel character device driver for an ultrasonic distance sensor with a user-space daemon that reads sensor data and publishes to MQTT. Demonstrates kernel-level device interfacing, interrupt-safe design, and real-time data bridging to IoT.”
+
+Architecture (high level)
+[HC-SR04 Sensor] --GPIO--> [Linux Kernel Module (char device)] <---> /dev/sensorX
+                                                         |
+                                                         | read()/ioctl from user-space
+                                                         v
+                                             [User-space daemon (C)] --MQTT--> [Broker/Node-RED]
+                                                         |
+                                                         v
+                                           Dashboard / Logging / Alerting
+
+
+Modules
+
+Kernel module (C):
+
+Expose /dev/ultrasonic0 character device
+
+Configure GPIOs, use kernel timer or interrupt (if hardware supports) to trigger & read echo
+
+Provide read() which returns last measured distance (atomic snapshot)
+
+Provide ioctl to change sampling period, threshold, or start/stop
+
+Use workqueue / tasklet or kernel thread to perform measurements (keep ISR minimal)
+
+User-space daemon (C):
+
+Opens /dev/ultrasonic0, performs blocking reads (or polls with select)
+
+Publishes readings to MQTT (calls system() to mosquitto_pub or links libmosquitto)
+
+Optionally serves an HTTP/Socket interface for dashboard
+
+Hardware & Platform
+
+Recommended: Raspberry Pi (Linux) — you can use GPIO and test easily.
+
+Sensor: HC-SR04 ultrasonic sensor (Trig and Echo lines). Use appropriate level shifting if needed.
+
+Safety & notes
+
+Kernel code must avoid long blocking or heavy work inside IRQ context. Use workqueues or kernel threads.
+
+Measuring HC-SR04 echo timing in kernel is possible via ktime_get() and busy-waiting with short sleeps (or use high-res timers). For a demo it's acceptable; for production, use hardware timers or user-space realtime.
+
+Files you’ll create
+
+ultrasonic_drv.c — kernel module (character device)
+
+Makefile — to build kernel module
+
+ultrasonic_user.c — user-space program (reads device and publishes)
+
+README.md — project explanation & run steps
+
+1) Kernel module: core ideas & code
+
+This is a complete but compact kernel module. It uses polling worker (kernel thread) to trigger the sensor and measure echo pulse width using gpiod_* APIs (preferred kernel GPIO API). It exposes a simple read() that returns a newline-terminated string with the latest distance in cm.
+
+Note: On Raspberry Pi, you must ensure CONFIG_GPIOLIB/gpiod support and choose correct GPIO numbers. Running kernel modules requires root.
+
+ultrasonic_drv.c
+// ultrasonic_drv.c
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/gpio/consumer.h>
+#include <linux/delay.h>
+#include <linux/kthread.h>
+#include <linux/mutex.h>
+#include <linux/wait.h>
+#include <linux/timekeeping.h>
+
+#define DEVICE_NAME "ultrasonic0"
+#define BUF_LEN 64
+#define DEFAULT_PERIOD_MS 500
+
+static int major;
+static struct class *ultrasonic_class;
+static struct device *ultrasonic_device;
+
+static struct gpio_desc *gpiod_trig;
+static struct gpio_desc *gpiod_echo;
+
+static struct task_struct *measure_thread;
+static unsigned int sample_period_ms = DEFAULT_PERIOD_MS;
+
+static char data_buf[BUF_LEN];
+static DEFINE_MUTEX(data_lock);
+static DECLARE_WAIT_QUEUE_HEAD(data_wq);
+static atomic_t data_ready = ATOMIC_INIT(0);
+
+/* Helper: generate 10us pulse on TRIG */
+static void trig_pulse(void)
+{
+    gpiod_set_value(gpiod_trig, 1);
+    udelay(10);
+    gpiod_set_value(gpiod_trig, 0);
+}
+
+/* Measure echo pulse width in microseconds. Return -1 on timeout */
+static long measure_pulse_us(void)
+{
+    struct timespec64 ts_start, ts_end;
+    long timeout_us = 30000; // 30 ms timeout (no echo)
+    long elapsed = 0;
+    unsigned int val;
+
+    // Wait for echo to go HIGH
+    do {
+        val = gpiod_get_value(gpiod_echo);
+        if (val) break;
+        udelay(1);
+        timeout_us--;
+        if (timeout_us <= 0) return -1;
+    } while (1);
+
+    ktime_get_real_ts64(&ts_start);
+
+    // Wait for echo to go LOW
+    timeout_us = 30000;
+    do {
+        val = gpiod_get_value(gpiod_echo);
+        if (!val) break;
+        udelay(1);
+        timeout_us--;
+        if (timeout_us <= 0) return -1;
+    } while (1);
+
+    ktime_get_real_ts64(&ts_end);
+
+    elapsed = (ts_end.tv_sec - ts_start.tv_sec) * 1000000LL
+            + (ts_end.tv_nsec - ts_start.tv_nsec) / 1000LL;
+    return elapsed;
+}
+
+/* Kernel thread: periodic sampling */
+static int measure_thread_fn(void *arg)
+{
+    while (!kthread_should_stop()) {
+        trig_pulse();
+        msleep(1); // small wait for sensor to set echo
+        long pulse_us = measure_pulse_us();
+        if (pulse_us > 0) {
+            // distance in cm: (pulse_us / 2) * speed_of_sound(0.0343 cm/us)
+            double distance = (pulse_us / 2.0) * 0.0343;
+            mutex_lock(&data_lock);
+            snprintf(data_buf, BUF_LEN, "DIST:%.2f\n", distance);
+            mutex_unlock(&data_lock);
+            atomic_set(&data_ready, 1);
+            wake_up_interruptible(&data_wq);
+        } else {
+            mutex_lock(&data_lock);
+            snprintf(data_buf, BUF_LEN, "DIST:ERR\n");
+            mutex_unlock(&data_lock);
+            atomic_set(&data_ready, 1);
+            wake_up_interruptible(&data_wq);
+        }
+        msleep(sample_period_ms);
+    }
+    return 0;
+}
+
+/* Char device file ops */
+static ssize_t ultrasonic_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
+{
+    int ret;
+    // Wait for data
+    if (!atomic_read(&data_ready)) {
+        if (wait_event_interruptible(data_wq, atomic_read(&data_ready)))
+            return -ERESTARTSYS;
+    }
+
+    mutex_lock(&data_lock);
+    ret = simple_read_from_buffer(buf, count, f_pos, data_buf, strlen(data_buf));
+    mutex_unlock(&data_lock);
+
+    atomic_set(&data_ready, 0);
+    return ret;
+}
+
+static ssize_t ultrasonic_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
+{
+    // accept simple commands: "PERIOD <ms>"
+    char kbuf[32];
+    if (count >= sizeof(kbuf)) return -EFAULT;
+    if (copy_from_user(kbuf, buf, count)) return -EFAULT;
+    kbuf[count] = 0;
+
+    if (sscanf(kbuf, "PERIOD %u", &sample_period_ms) == 1) {
+        pr_info("ultrasonic: period set to %u ms\n", sample_period_ms);
+        return count;
+    }
+    return -EINVAL;
+}
+
+static const struct file_operations ultrasonic_fops = {
+    .owner = THIS_MODULE,
+    .read  = ultrasonic_read,
+    .write = ultrasonic_write,
+};
+
+static int __init ultrasonic_init(void)
+{
+    int ret;
+    pr_info("ultrasonic: init\n");
+
+    major = register_chrdev(0, DEVICE_NAME, &ultrasonic_fops);
+    if (major < 0) {
+        pr_err("ultrasonic: register_chrdev failed\n");
+        return major;
+    }
+
+    ultrasonic_class = class_create(THIS_MODULE, "ultrasonic");
+    if (IS_ERR(ultrasonic_class)) {
+        unregister_chrdev(major, DEVICE_NAME);
+        return PTR_ERR(ultrasonic_class);
+    }
+
+    ultrasonic_device = device_create(ultrasonic_class, NULL, MKDEV(major, 0), NULL, DEVICE_NAME);
+    if (IS_ERR(ultrasonic_device)) {
+        class_destroy(ultrasonic_class);
+        unregister_chrdev(major, DEVICE_NAME);
+        return PTR_ERR(ultrasonic_device);
+    }
+
+    // Obtain GPIO descriptors by consumer labels (device tree) or by GPIO numbers
+    // For simplicity use gpio_request by number (change to your GPIOs)
+    // Better: use gpiod_get_optional() with consumer name and line numbers from DT
+    gpiod_trig = gpio_to_desc(23); // change to actual trig gpio
+    gpiod_echo = gpio_to_desc(24); // change to actual echo gpio
+    if (!gpiod_trig || !gpiod_echo) {
+        pr_err("ultrasonic: failed to get gpio descriptors\n");
+        device_destroy(ultrasonic_class, MKDEV(major, 0));
+        class_destroy(ultrasonic_class);
+        unregister_chrdev(major, DEVICE_NAME);
+        return -ENODEV;
+    }
+
+    gpiod_direction_output(gpiod_trig, 0);
+    gpiod_direction_input(gpiod_echo);
+
+    measure_thread = kthread_run(measure_thread_fn, NULL, "ultra_thread");
+    if (IS_ERR(measure_thread)) {
+        pr_err("ultrasonic: could not create thread\n");
+        device_destroy(ultrasonic_class, MKDEV(major, 0));
+        class_destroy(ultrasonic_class);
+        unregister_chrdev(major, DEVICE_NAME);
+        return PTR_ERR(measure_thread);
+    }
+
+    pr_info("ultrasonic: module loaded, major=%d\n", major);
+    return 0;
+}
+
+static void __exit ultrasonic_exit(void)
+{
+    pr_info("ultrasonic: exit\n");
+    if (measure_thread)
+        kthread_stop(measure_thread);
+    device_destroy(ultrasonic_class, MKDEV(major, 0));
+    class_destroy(ultrasonic_class);
+    unregister_chrdev(major, DEVICE_NAME);
+    pr_info("ultrasonic: module unloaded\n");
+}
+
+module_init(ultrasonic_init);
+module_exit(ultrasonic_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Nitin");
+MODULE_DESCRIPTION("Ultrasonic sensor char device driver (demo)");
+
+
+Important implementation notes
+
+gpio_to_desc() usage above is a placeholder. On many systems you should use gpiod_get() / devm_gpiod_get() with device tree or specify GPIO by number via gpio_request(). Adjust based on your target platform. On Raspberry Pi, many people use the gpio sysfs in user-space, or gpiod consumer API in kernel modules with correct device binding.
+
+The module spawns a kernel thread (kthread_run) to do periodic measuring so heavy work is not done in ISR. The thread uses gpiod_get_value() to read echo pin — this is simple but can work for demos.
+
+For production/real-time, prefer hardware timers or avoid busy-wait loops.
+
+2) Makefile (to build kernel module)
+
+Create Makefile:
+
+obj-m += ultrasonic_drv.o
+
+KDIR := /lib/modules/$(shell uname -r)/build
+PWD := $(shell pwd)
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+
+
+Build:
+
+make
+
+
+Install:
+
+sudo insmod ultrasonic_drv.ko
+# Check dmesg for logs
+dmesg | tail
+ls -l /dev/ultrasonic0
+
+
+Remove:
+
+sudo rmmod ultrasonic_drv
+
+3) User-space program (C) — read device and publish to MQTT
+
+You can use libmosquitto for MQTT or simply call system("mosquitto_pub ..."). Using libmosquitto is cleaner.
+
+Example ultrasonic_user.c using libmosquitto:
+
+// ultrasonic_user.c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <mosquitto.h>
+
+#define DEV_PATH "/dev/ultrasonic0"
+#define BUF_LEN 64
+
+int main(int argc, char *argv[])
+{
+    int fd = open(DEV_PATH, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+
+    struct mosquitto *mosq;
+    mosquitto_lib_init();
+    mosq = mosquitto_new(NULL, true, NULL);
+    if (!mosq) {
+        fprintf(stderr, "Failed to create mosquitto instance\n");
+        close(fd);
+        return 1;
+    }
+    // Connect to local broker
+    if (mosquitto_connect(mosq, "localhost", 1883, 60)) {
+        fprintf(stderr, "Could not connect to broker\n");
+        mosquitto_destroy(mosq);
+        close(fd);
+        return 1;
+    }
+
+    char buf[BUF_LEN];
+    while (1) {
+        lseek(fd, 0, SEEK_SET);
+        ssize_t n = read(fd, buf, BUF_LEN-1);
+        if (n > 0) {
+            buf[n] = 0;
+            // optional parse: "DIST:xx.xx\n"
+            printf("Read: %s", buf);
+            // Publish to topic
+            mosquitto_publish(mosq, NULL, "parking/slot1/distance", strlen(buf), buf, 0, false);
+        } else {
+            // no data, wait
+            sleep(1);
+        }
+        mosquitto_loop(mosq, 0, 1);
+        sleep(1);
+    }
+
+    mosquitto_destroy(mosq);
+    mosquitto_lib_cleanup();
+    close(fd);
+    return 0;
+}
+
+
+Build:
+
+gcc -o ultrasonic_user ultrasonic_user.c -lmosquitto
+
+
+Run:
+
+sudo ./ultrasonic_user
+
+
+You can then use mosquitto_sub -t 'parking/#' -v to see messages, or connect Node-RED / MQTT Explorer.
+
+4) How to test (step-by-step)
+
+Setup hardware: connect HC-SR04 Trig to GPIO (configured trig), Echo to echo GPIO (use level shifting if needed). Power sensor from 5V but ensure GPIO inputs tolerant — better use voltage divider on Echo (HC-SR04 echo is 5V on many boards). Safety first.
+
+Build module: make → sudo insmod ultrasonic_drv.ko
+
+Check dmesg for messages (module loaded, major number, etc.).
+
+Confirm character device exists: /dev/ultrasonic0 (if not, create device node with mknod using the major printed by dmesg).
+
+Run user-space daemon: sudo ./ultrasonic_user. It will open /dev/ultrasonic0 and publish readings to MQTT.
+
+Observe logs: use mosquitto_sub -h localhost -t 'parking/#' -v or MQTT Explorer.
+
+Manual read: sudo cat /dev/ultrasonic0 should display something like DIST:23.45.
+
+Tweak sample rate: write to device echo "PERIOD 200" > /dev/ultrasonic0 to set sampling to 200ms.
+
+5) Demo script / checklist for interview or submission
+
+10-second run showing:
+
+dmesg output after module insertion
+
+ls /dev | grep ultrasonic
+
+sudo cat /dev/ultrasonic0 showing distances
+
+mosquitto_sub showing MQTT messages from user daemon
+
+Move object in front of sensor and show distance change & MQTT publish
+
+Show ultrasonic_drv.c key parts and explain kernel threading vs ISR, race protection with mutex, and why avoiding heavy ISR work is important.
+
+Discuss improvements: hardware timers, kernel PWM, device tree binding.
+
+6) What to include on resume (concise bullet)
+
+Linux Kernel Device Driver — Ultrasonic Sensor (C)
+
+Implemented a character device kernel module to interface with HC-SR04 ultrasonic sensor, exposing /dev/ultrasonic0.
+
+Designed kernel-thread based sampling, safe concurrency (mutexes, wait queues), and ioctl/write controls for runtime reconfiguration.
+
+Built user-space daemon (C + libmosquitto) to publish telemetry to MQTT and integrate with Node-RED dashboard.
+
+Demonstrates device driver development, kernel APIs, GPIO control, and IoT bridging.
