@@ -1,0 +1,342 @@
+Smart Home Automation using ESP32 — Project Plan
+1) Project Overview
+
+Goal: Control home appliances (e.g., lamp, fan) using an ESP32 via Wi-Fi using MQTT. Provide local control (buttons) and remote control via a Node-RED dashboard (web/mobile). Log sensor data (temperature/humidity) and show live values.
+
+Key features:
+>Control multiple relays (ON/OFF) via MQTT topics.
+>Local push-button interrupts for manual control.
+>Publish sensor telemetry (DHT22) periodically.
+>Node-RED dashboard to control & monitor devices.
+>Optionally use secured MQTT (username/password).
+
+2) Bill of Materials (BOM)
+ESP32 development board (e.g., ESP32-DevKitC) — 1
+4-channel Relay module (5V) — 1 (or as many channels as devices)
+DHT22 or DHT11 temperature/humidity sensor — 1
+Push buttons (momentary) — 2 (for local control)
+10kΩ resistors (for pull-downs/pull-ups) — 2
+Jumper wires, breadboard
+USB cable for ESP32
+(Optional) 5V power supply for relays (if using external)
+MQTT broker: Mosquitto server (local PC/RPi or cloud) or free broker (test.mosquitto.org)
+
+3) System Architecture (high level)
+[Mobile/Web Browser] <--HTTP--> [Node-RED Dashboard]
+      ↑                               ↑
+      | (MQTT publish/sub)            | (MQTT connect)
+      |                               |
+  Internet/Wi-Fi -------------------- MQTT Broker (Mosquitto)
+                                       |
+                                       |
+                                   ESP32 (client)
+                                   - Subscribes to control topics
+                                   - Publishes telemetry topics
+                                   - Reads buttons via interrupts
+                                   - Drives relays (GPIO)
+                                   - Reads DHT sensor
+
+
+
+4) MQTT Topic Scheme (recommended)
+Use a predictable topic structure:
+home/<room>/device/<id>/set — payload: "ON" / "OFF" (commands to ESP32)
+home/<room>/device/<id>/state — payload: "ON" / "OFF" (ESP32 publishes current state)
+home/<room>/sensor/temperature — payload: numeric (°C)
+home/<room>/sensor/humidity — payload: numeric (%)
+home/esp32/online — payload: "true" / "false" (last-will/online status)
+Example:
+home/livingroom/device/1/set
+home/livingroom/device/1/state
+home/livingroom/sensor/temperature
+
+
+5) Wiring & Pin Assignments (example)
+Assume ESP32 DevKit, change pins if needed.
+Relay IN1 -> GPIO 16
+Relay IN2 -> GPIO 17
+Relay VCC -> 5V (module) (or 3.3V depending on module)
+Relay GND -> GND
+DHT22 DATA -> GPIO 4 (with pull-up on DATA line)
+DHT22 VCC -> 3.3V
+DHT22 GND -> GND
+Button1 -> GPIO 0 (one side to GPIO, other to GND; use internal pull-up)
+Button2 -> GPIO 2
+ESP32 GND -> Relay GND (common ground)
+
+
+
+
+
+6) Firmware — Complete Arduino (C/C++) Code
+/*
+  esp32_smart_home.ino
+  Smart Home Automation (ESP32) using MQTT + DHT22 + Relays + Buttons (interrupts)
+  Requirements:
+    - Arduino core for ESP32 installed
+    - PubSubClient library
+    - DHT sensor library (Adafruit or equivalent)
+*/
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "DHT.h"
+
+// ========== CONFIG ==========
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+
+const char* mqtt_server = "BROKER_IP_OR_HOST"; // e.g., "192.168.1.10" or "broker.hivemq.com"
+const int mqtt_port = 1883;
+const char* mqtt_user = ""; // set if used
+const char* mqtt_pass = ""; // set if used
+
+const char* baseTopic = "home/livingroom"; // change room as needed
+const char* deviceId = "device1";
+
+#define DHTPIN 4
+#define DHTTYPE DHT22
+
+// GPIO for relays
+const int RELAY1_PIN = 16;
+const int RELAY2_PIN = 17;
+
+// Buttons (use internal pullup)
+const int BUTTON1_PIN = 0;
+const int BUTTON2_PIN = 2;
+
+// Debounce
+volatile unsigned long lastInterruptTime1 = 0;
+volatile unsigned long lastInterruptTime2 = 0;
+
+DHT dht(DHTPIN, DHTTYPE);
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// Forward declarations
+void connectWiFi();
+void connectMQTT();
+void mqttCallback(char* topic, byte* payload, unsigned int length);
+void publishState(int relayPin, const char* topicState);
+void IRAM_ATTR handleButton1();
+void IRAM_ATTR handleButton2();
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  pinMode(RELAY1_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  digitalWrite(RELAY1_PIN, LOW); // assuming LOW = OFF, set based on relay logic
+  digitalWrite(RELAY2_PIN, LOW);
+
+  pinMode(BUTTON1_PIN, INPUT_PULLUP);
+  pinMode(BUTTON2_PIN, INPUT_PULLUP);
+
+  // Attach interrupts: FALLING (button press to ground)
+  attachInterrupt(BUTTON1_PIN, handleButton1, FALLING);
+  attachInterrupt(BUTTON2_PIN, handleButton2, FALLING);
+
+  dht.begin();
+
+  connectWiFi();
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(mqttCallback);
+
+  // Last Will testament
+  String lastWillTopic = String(baseTopic) + "/esp32/online";
+  client.disconnect();
+  // PubSubClient doesn't set Last Will easily; instead publish online status after connect
+}
+
+void loop() {
+  if (!client.connected()) {
+    connectMQTT();
+  }
+  client.loop();
+
+  static unsigned long lastTelem = 0;
+  unsigned long now = millis();
+  if (now - lastTelem > 15000) { // every 15 seconds
+    lastTelem = now;
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (!isnan(t) && !isnan(h)) {
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%.2f", t);
+      String topicT = String(baseTopic) + "/sensor/temperature";
+      client.publish(topicT.c_str(), buf, true);
+
+      snprintf(buf, sizeof(buf), "%.2f", h);
+      String topicH = String(baseTopic) + "/sensor/humidity";
+      client.publish(topicH.c_str(), buf, true);
+
+      Serial.printf("Published Temp: %s, Humidity: %s\n", topicT.c_str(), topicH.c_str());
+    } else {
+      Serial.println("Failed to read DHT sensor");
+    }
+  }
+}
+
+// ===== Functions =====
+void connectWiFi() {
+  Serial.printf("Connecting to WiFi: %s\n", ssid);
+  WiFi.begin(ssid, password);
+  int tries = 0;
+  while (WiFi.status() != WL_CONNECTED && tries < 30) {
+    delay(500);
+    Serial.print(".");
+    tries++;
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nFailed to connect to WiFi");
+  }
+}
+
+void connectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    String clientId = "esp32-" + String(WiFi.macAddress());
+    bool ok;
+    if (strlen(mqtt_user) > 0) {
+      ok = client.connect(clientId.c_str(), mqtt_user, mqtt_pass, (String(baseTopic)+"/esp32/online").c_str(), 0, true, "false");
+    } else {
+      ok = client.connect(clientId.c_str());
+    }
+    if (ok) {
+      Serial.println("connected");
+      // Publish online status
+      String topicOnline = String(baseTopic) + "/esp32/online";
+      client.publish(topicOnline.c_str(), "true", true);
+      // Subscribe to control topics
+      String t1 = String(baseTopic) + "/device/1/set";
+      String t2 = String(baseTopic) + "/device/2/set";
+      client.subscribe(t1.c_str());
+      client.subscribe(t2.c_str());
+      // Request retained state if needed
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5s");
+      delay(5000);
+    }
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  Serial.printf("Message arrived [%s]: %s\n", topic, msg.c_str());
+
+  String sTopic = String(topic);
+  if (sTopic.endsWith("/device/1/set")) {
+    if (msg.equalsIgnoreCase("ON")) {
+      digitalWrite(RELAY1_PIN, HIGH);
+      publishState(RELAY1_PIN, (String(baseTopic) + "/device/1/state").c_str());
+    } else if (msg.equalsIgnoreCase("OFF")) {
+      digitalWrite(RELAY1_PIN, LOW);
+      publishState(RELAY1_PIN, (String(baseTopic) + "/device/1/state").c_str());
+    }
+  } else if (sTopic.endsWith("/device/2/set")) {
+    if (msg.equalsIgnoreCase("ON")) {
+      digitalWrite(RELAY2_PIN, HIGH);
+      publishState(RELAY2_PIN, (String(baseTopic) + "/device/2/state").c_str());
+    } else if (msg.equalsIgnoreCase("OFF")) {
+      digitalWrite(RELAY2_PIN, LOW);
+      publishState(RELAY2_PIN, (String(baseTopic) + "/device/2/state").c_str());
+    }
+  }
+}
+
+void publishState(int relayPin, const char* topicState) {
+  const char* state = (digitalRead(relayPin) == HIGH) ? "ON" : "OFF";
+  client.publish(topicState, state, true);
+  Serial.printf("Published state %s to %s\n", state, topicState);
+}
+
+// ===== Interrupt handlers =====
+void IRAM_ATTR handleButton1() {
+  unsigned long t = millis();
+  if (t - lastInterruptTime1 > 200) {
+    // toggle relay1
+    int cur = digitalRead(RELAY1_PIN);
+    digitalWrite(RELAY1_PIN, !cur);
+    // publish new state - note: avoid heavy operations inside ISR; flag system in real use
+    String topic = String(baseTopic) + "/device/1/state";
+    if (client.connected()) {
+      client.publish(topic.c_str(), (digitalRead(RELAY1_PIN) ? "ON" : "OFF"), true);
+    }
+    lastInterruptTime1 = t;
+  }
+}
+
+void IRAM_ATTR handleButton2() {
+  unsigned long t = millis();
+  if (t - lastInterruptTime2 > 200) {
+    int cur = digitalRead(RELAY2_PIN);
+    digitalWrite(RELAY2_PIN, !cur);
+    String topic = String(baseTopic) + "/device/2/state";
+    if (client.connected()) {
+      client.publish(topic.c_str(), (digitalRead(RELAY2_PIN) ? "ON" : "OFF"), true);
+    }
+    lastInterruptTime2 = t;
+  }
+}
+
+
+
+Notes about the code
+Change ssid, password, mqtt_server accordingly.
+The code uses interrupts for buttons — ISR toggles relays and publishes state. For production, better to set flags in ISR and handle MQTT publish in loop to avoid heavy ISR work.
+digitalWrite HIGH/LOW mapping depends on your relay module (active LOW vs HIGH). Test and invert if necessary.
+Add MQTT username/password if your broker requires auth.
+
+
+7) Setting up MQTT Broker (Mosquitto) — Quickstart (on PC/RPi)
+Linux (Ubuntu / RPi):
+sudo apt update
+sudo apt install mosquitto mosquitto-clients -y
+sudo systemctl enable mosquitto
+sudo systemctl start mosquitto
+# Test publish/subscribe
+mosquitto_sub -h localhost -t "home/livingroom/#" -v
+mosquitto_pub -h localhost -t "home/livingroom/device/1/set" -m "ON"
+
+
+8) Node-RED Dashboard Setup (simple)
+Install Node-RED (on PC or Raspberry Pi).
+sudo npm i -g --unsafe-perm node-red
+Start: node-red
+Open http://localhost:1880 in browser.
+Install node-red-dashboard and node-red-contrib-mqtt-broker if needed via Manage Palette.
+Flow outline:
+MQTT in node subscribing to home/livingroom/sensor/# → gauge/text nodes to display temp/humidity.
+UI Button nodes → MQTT out to home/livingroom/device/1/set with payload "ON"/"OFF".
+MQTT in for home/livingroom/device/1/state → UI LED node (or text) to show current device state.
+You can create a dashboard at http://<node-red-host>:1880/ui.
+
+
+9) Testing Checklist
+Flash firmware to ESP32; watch Serial Monitor for IP and MQTT connection messages.
+On successful connection, check that home/livingroom/esp32/online published "true".
+Use mosquitto_sub or MQTT Explorer to subscribe to home/livingroom/# and watch messages.
+Press local buttons → ensure relays toggle and state messages published.
+From Node-RED dashboard, press UI buttons → ensure ESP32 receives set messages and toggles relays.
+Verify telemetry (temperature/humidity) appears every 15 seconds.
+
+10) Debugging Tips & Common Issues
+No Wi-Fi: Check SSID/password, WiFi channel (2.4 GHz only), router MAC filtering.
+MQTT fail to connect: Verify broker host/port, firewall, and credentials.
+Relays not switching: Check wiring, common ground, and whether relay is active LOW (inverted).
+DHT returns NaN: Check wiring, correct pin, and timing (DHT needs single digital pin).
+ISR causing crashes: Keep ISR minimal. Set flags in ISR and process in loop().
+
+
+11) Security & Production Notes
+Use TLS (MQTTS) and broker authentication in real deployment.
+Avoid using attachInterrupt heavy logic — use flagging pattern for reliability.
+For multiple devices and scale, consider using MQTT topic namespaces and retained messages for state persistence.
